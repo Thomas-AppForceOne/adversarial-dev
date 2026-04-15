@@ -3,36 +3,56 @@ import { join } from "path";
 import { execSync } from "child_process";
 import type { SprintContract, EvalResult, HarnessProgress } from "./types.ts";
 
-export async function initWorkspace(workDir: string): Promise<void> {
+export async function initWorkspace(
+  workDir: string,
+  appDir?: string,
+  skipSpecClear = false,
+  resume = false,
+): Promise<void> {
   await mkdir(join(workDir, "contracts"), { recursive: true });
   await mkdir(join(workDir, "feedback"), { recursive: true });
-  await mkdir(join(workDir, "app"), { recursive: true });
 
-  // Clean stale artifacts from previous runs
-  try { await unlink(join(workDir, "spec.md")); } catch {}
-  try { await unlink(join(workDir, "progress.json")); } catch {}
-  for (const dir of ["contracts", "feedback"]) {
-    try {
-      const files = await readdir(join(workDir, dir));
-      for (const f of files) {
-        await unlink(join(workDir, dir, f));
-      }
-    } catch {}
+  if (!resume) {
+    // Fresh run — clean stale artifacts from previous runs.
+    // Skip spec.md deletion when a pre-written spec will be written after initWorkspace.
+    if (!skipSpecClear) {
+      try { await unlink(join(workDir, "spec.md")); } catch {}
+    }
+    try { await unlink(join(workDir, "progress.json")); } catch {}
+    for (const dir of ["contracts", "feedback"]) {
+      try {
+        const files = await readdir(join(workDir, dir));
+        for (const f of files) {
+          await unlink(join(workDir, dir, f));
+        }
+      } catch {}
+    }
   }
+  // Resume mode: leave spec.md, progress.json, contracts/, and feedback/ intact.
 
-  // Initialize app/ as its own git repo so agent commits stay isolated
-  const appDir = join(workDir, "app");
-  const gitDir = join(appDir, ".git");
-  try {
-    await access(gitDir);
-  } catch {
+  if (appDir) {
+    // Targeting an existing codebase — verify it exists but do not modify it
     try {
-      execSync("git init && git commit --allow-empty -m \"Initial commit\"", {
-        cwd: appDir,
-        stdio: "ignore",
-      });
-    } catch (err) {
-      console.warn(`Warning: failed to initialize git in ${appDir}: ${err}`);
+      await access(appDir);
+    } catch {
+      throw new Error(`Target directory does not exist: ${appDir}`);
+    }
+  } else {
+    // Greenfield mode — create and initialize a fresh app/ subdirectory
+    const freshAppDir = join(workDir, "app");
+    await mkdir(freshAppDir, { recursive: true });
+    const gitDir = join(freshAppDir, ".git");
+    try {
+      await access(gitDir);
+    } catch {
+      try {
+        execSync("git init && git commit --allow-empty -m \"Initial commit\"", {
+          cwd: freshAppDir,
+          stdio: "ignore",
+        });
+      } catch (err) {
+        console.warn(`Warning: failed to initialize git in ${freshAppDir}: ${err}`);
+      }
     }
   }
 }

@@ -1,33 +1,40 @@
 import { Codex } from "@openai/codex-sdk";
-import { GENERATOR_SYSTEM_PROMPT } from "../shared/prompts.ts";
+import { GENERATOR_SYSTEM_PROMPT, GENERATOR_EXISTING_SYSTEM_PROMPT } from "../shared/prompts.ts";
 import { CODEX_MODEL, CODEX_NETWORK_ACCESS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 import type { SprintContract, EvalResult } from "../shared/types.ts";
 
 export async function runGenerator(
   workDir: string,
+  appDir: string,
   spec: string,
   contract: SprintContract,
   previousFeedback?: EvalResult,
 ): Promise<{ response: string }> {
   const sprint = contract.sprintNumber;
   const attempt = previousFeedback ? "retry" : "initial";
+  const isExisting = appDir !== `${workDir}/app` && appDir !== workDir + "/app";
   log("GENERATOR", `Sprint ${sprint} (${attempt}) - Building: ${contract.features.join(", ")}`);
 
-  let taskPrompt = `## Product Spec\n\n${spec}\n\n## Sprint Contract\n\n${JSON.stringify(contract, null, 2)}`;
+  let taskPrompt = isExisting
+    ? `IMPORTANT: You are working on an existing codebase at ${appDir}. Read and understand the existing code before making changes. Your harness state directory is ${workDir} (where spec.md and contracts live).\n\n## Product Spec\n\n${spec}\n\n## Sprint Contract\n\n${JSON.stringify(contract, null, 2)}`
+    : `## Product Spec\n\n${spec}\n\n## Sprint Contract\n\n${JSON.stringify(contract, null, 2)}`;
 
   if (previousFeedback) {
     taskPrompt += `\n\n## Evaluation Feedback (MUST ADDRESS)\n\n${JSON.stringify(previousFeedback, null, 2)}`;
     taskPrompt += `\n\nThe previous attempt failed evaluation. Address every issue in the feedback above.`;
+  } else if (isExisting) {
+    taskPrompt += `\n\nExplore the existing codebase at ${appDir} first, then implement the features listed in this sprint contract.`;
   } else {
     taskPrompt += `\n\nImplement the features listed in this sprint contract. Work in the \`app/\` directory.`;
   }
 
-  const fullPrompt = `${GENERATOR_SYSTEM_PROMPT}\n\n---\n\n${taskPrompt}`;
+  const systemPrompt = isExisting ? GENERATOR_EXISTING_SYSTEM_PROMPT : GENERATOR_SYSTEM_PROMPT;
+  const fullPrompt = `${systemPrompt}\n\n---\n\n${taskPrompt}`;
 
   const codex = new Codex();
   const thread = codex.startThread({
-    workingDirectory: workDir,
+    workingDirectory: isExisting ? appDir : workDir,
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",

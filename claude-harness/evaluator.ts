@@ -1,18 +1,20 @@
-import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { EVALUATOR_SYSTEM_PROMPT } from "../shared/prompts.ts";
 import { CLAUDE_MODEL, CLAUDE_MAX_TURNS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
+import { runClaude } from "../shared/claude-cli.ts";
+import { recordClaudeResult } from "../shared/usage.ts";
 import type { SprintContract, EvalResult } from "../shared/types.ts";
 
 export async function runEvaluator(
   workDir: string,
+  appDir: string,
   contract: SprintContract,
   passThreshold: number,
 ): Promise<EvalResult> {
   const sprint = contract.sprintNumber;
   log("EVALUATOR", `Evaluating sprint ${sprint} against ${contract.criteria.length} criteria`);
 
-  const prompt = `IMPORTANT: Your working directory is ${workDir}. The application code is in ${workDir}/app/. All file operations must be within ${workDir}.
+  const prompt = `IMPORTANT: The application code is at ${appDir}. Your harness state directory is ${workDir}.
 
 ## Sprint Contract to Evaluate Against
 
@@ -24,32 +26,28 @@ Each criterion must score at least ${passThreshold}/10 to pass.
 
 ## Instructions
 
-Examine the application in the \`app/\` directory. Read the code, run it if possible, and score each criterion. Output ONLY the JSON evaluation object.`;
-
-  const options: Options = {
-    cwd: workDir,
-    systemPrompt: EVALUATOR_SYSTEM_PROMPT,
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
-    tools: ["Read", "Bash", "Glob", "Grep"],
-    model: CLAUDE_MODEL,
-    maxTurns: CLAUDE_MAX_TURNS,
-    persistSession: false,
-  };
+Examine the application at ${appDir}. Read the code, run it if possible, and score each criterion. Output ONLY the JSON evaluation object.`;
 
   let fullResponse = "";
 
-  for await (const msg of query({ prompt, options })) {
+  for await (const msg of runClaude({
+    prompt,
+    cwd: appDir,
+    systemPrompt: EVALUATOR_SYSTEM_PROMPT,
+    tools: ["Read", "Bash", "Glob", "Grep"],
+    model: CLAUDE_MODEL,
+    maxTurns: CLAUDE_MAX_TURNS,
+  })) {
     if (msg.type === "assistant") {
-      const message = msg as { message: { content: Array<{ type: string; text?: string; name?: string }> } };
-      for (const block of message.message.content) {
-        if (block.type === "text" && block.text) {
+      for (const block of msg.message.content) {
+        if (block.type === "text") {
           fullResponse += block.text;
-        } else if (block.type === "tool_use" && block.name) {
+        } else if (block.type === "tool_use") {
           log("EVALUATOR", `  Tool: ${block.name}`);
         }
       }
     } else if (msg.type === "result") {
+      recordClaudeResult(`EVALUATOR/sprint ${sprint}`, msg);
       log("EVALUATOR", `Evaluation complete for sprint ${sprint}`);
     }
   }

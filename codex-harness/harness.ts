@@ -1,3 +1,5 @@
+import { join } from "path";
+import { readFile } from "fs/promises";
 import { Codex } from "@openai/codex-sdk";
 import {
   CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
@@ -22,7 +24,7 @@ import type {
   SprintResult,
 } from "../shared/types.ts";
 
-import { runPlanner } from "./planner.ts";
+import { runPlanner, runPlannerFromSpecsDir } from "./planner.ts";
 import { runGenerator } from "./generator.ts";
 import { runEvaluator } from "./evaluator.ts";
 
@@ -30,11 +32,15 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
   const startTime = Date.now();
   const results: SprintResult[] = [];
 
+  const appDir = config.appDir ?? join(config.workDir, "app");
+  const mode = config.appDir ? "existing codebase" : "greenfield";
+
   log("HARNESS", "Initializing Codex SDK harness");
   log("HARNESS", `Work directory: ${config.workDir}`);
+  log("HARNESS", `App directory:  ${appDir} (${mode})`);
   log("HARNESS", `Max sprints: ${config.maxSprints} | Max retries: ${config.maxRetriesPerSprint} | Threshold: ${config.passThreshold}/10`);
 
-  await initWorkspace(config.workDir);
+  await initWorkspace(config.workDir, config.appDir, !!(config.specFile || config.specsDir));
 
   // Phase 1: Planning
   logDivider();
@@ -50,16 +56,24 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
   };
   await writeProgress(config.workDir, progress);
 
-  const plannerResponse = await runPlanner(config.userPrompt, config.workDir);
-
-  // Planner may have written spec.md via its tools, or returned it as text
   let spec: string;
-  try {
+  if (config.specFile) {
+    log("HARNESS", `Using provided spec: ${config.specFile}`);
+    spec = await readFile(config.specFile, "utf-8");
+    await writeSpec(config.workDir, spec);
+  } else if (config.specsDir) {
+    log("HARNESS", `Assembling spec from directory: ${config.specsDir}`);
+    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir);
     spec = await readSpec(config.workDir);
-  } catch {
-    log("HARNESS", "Planner returned spec as text, writing to spec.md");
-    await writeSpec(config.workDir, plannerResponse);
-    spec = plannerResponse;
+  } else {
+    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir);
+    try {
+      spec = await readSpec(config.workDir);
+    } catch {
+      log("HARNESS", "Planner returned spec as text, writing to spec.md");
+      await writeSpec(config.workDir, plannerResponse);
+      spec = plannerResponse;
+    }
   }
 
   // Parse sprint count from spec - look for "Sprint N" patterns
@@ -103,13 +117,13 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
       progress.retryCount = retry;
       await writeProgress(config.workDir, progress);
 
-      await runGenerator(config.workDir, spec, contract, lastEval);
+      await runGenerator(config.workDir, appDir, spec, contract, lastEval);
 
       // Evaluate
       progress.status = "evaluating";
       await writeProgress(config.workDir, progress);
 
-      lastEval = await runEvaluator(config.workDir, contract, config.passThreshold);
+      lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold);
       await writeFeedback(config.workDir, sprint, retry, lastEval);
 
       if (lastEval.passed) {

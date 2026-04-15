@@ -1,0 +1,26 @@
+services:
+
+  # The harness container runs `claude -p` subprocesses for every agent turn.
+  # Claude Code handles its own authentication using the credentials file we
+  # mount read-only — so Anthropic sees legitimate Claude Code traffic and
+  # token refresh happens inside the binary, for free.
+  agent:
+    build:
+      context: .
+    environment:
+      # API-key mode: passthrough. Claude Code will prefer this over OAuth.
+      # Empty string is treated as "not set" by Claude Code.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - "${PROJECT_DIR}:/project:rw"
+      - "${WORKSPACE_DIR}:/harness/workspace:rw"
+      # Subscription mode: Claude Code reads OAuth tokens from this file and
+      # refreshes them in-place. We mount it read-write so refresh can write
+      # the new token back; the file lives under ~/.adev on the host, NOT in
+      # the Keychain itself, so refreshes here don't stomp on the host's own
+      # Claude Code sessions.
+      - "${CRED_FILE}:/home/bun/.claude/.credentials.json:rw"
+    working_dir: /harness
+    entrypoint: ["bun", "run"]
+    # CMD / args are supplied by `docker compose run agent <harness> <args>`

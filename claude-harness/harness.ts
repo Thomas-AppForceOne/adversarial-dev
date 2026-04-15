@@ -1,9 +1,12 @@
-import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { join } from "path";
+import { readFile } from "fs/promises";
 import {
   CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
   CONTRACT_NEGOTIATION_EVALUATOR_PROMPT,
 } from "../shared/prompts.ts";
 import { CLAUDE_MODEL } from "../shared/config.ts";
+import { runClaude } from "../shared/claude-cli.ts";
+import { recordClaudeResult, formatUsageReport } from "../shared/usage.ts";
 import { log, logError, logDivider } from "../shared/logger.ts";
 import {
   initWorkspace,
@@ -13,6 +16,7 @@ import {
   readContract,
   writeFeedback,
   writeProgress,
+  readProgress,
 } from "../shared/files.ts";
 import type {
   HarnessConfig,
@@ -23,7 +27,7 @@ import type {
   SprintResult,
 } from "../shared/types.ts";
 
-import { runPlanner } from "./planner.ts";
+import { runPlanner, runPlannerFromSpecsDir } from "./planner.ts";
 import { runGenerator } from "./generator.ts";
 import { runEvaluator } from "./evaluator.ts";
 
@@ -31,37 +35,71 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
   const startTime = Date.now();
   const results: SprintResult[] = [];
 
-  log("HARNESS", "Initializing Claude Agent SDK harness");
+  const appDir = config.appDir ?? join(config.workDir, "app");
+  const mode = config.appDir ? "existing codebase" : "greenfield";
+
+  log("HARNESS", "Initializing Claude Code subprocess harness");
   log("HARNESS", `Work directory: ${config.workDir}`);
+  log("HARNESS", `App directory:  ${appDir} (${mode})`);
   log("HARNESS", `Max sprints: ${config.maxSprints} | Max retries: ${config.maxRetriesPerSprint} | Threshold: ${config.passThreshold}/10`);
+  if (config.resume) log("HARNESS", "RESUME MODE — reusing existing spec + skipping completed sprints");
 
-  await initWorkspace(config.workDir);
+  await initWorkspace(
+    config.workDir,
+    config.appDir,
+    !!(config.specFile || config.specsDir),
+    config.resume,
+  );
 
-  // Phase 1: Planning
+  // ---- Resume: load previous progress if available ----
+  let resumedProgress: HarnessProgress | null = null;
+  let startSprint = 1;
+
+  if (config.resume) {
+    try {
+      resumedProgress = await readProgress(config.workDir);
+      startSprint = resumedProgress.completedSprints + 1;
+      if (startSprint > 1) {
+        log("HARNESS", `Previous run completed ${resumedProgress.completedSprints} sprints — resuming from sprint ${startSprint}`);
+        // Populate results for already-completed sprints so the final
+        // report is accurate.
+        for (let s = 1; s < startSprint; s++) {
+          results.push({ sprintNumber: s, passed: true, attempts: 1 });
+        }
+      }
+    } catch {
+      log("HARNESS", "No previous progress found — starting from scratch");
+    }
+  }
+
+  // ---- Phase 1: Planning ----
   logDivider();
-  log("HARNESS", "PHASE 1: PLANNING");
+
+  let spec: string;
+
+  // On resume, try to reuse the existing spec.md first.
+  if (config.resume) {
+    try {
+      spec = await readSpec(config.workDir);
+      log("HARNESS", "PHASE 1: PLANNING (reusing existing spec.md)");
+    } catch {
+      log("HARNESS", "PHASE 1: PLANNING (spec.md not found, re-running planner)");
+      spec = await planFromScratch(config);
+    }
+  } else {
+    log("HARNESS", "PHASE 1: PLANNING");
+    spec = await planFromScratch(config);
+  }
+
   logDivider();
 
   const progress: HarnessProgress = {
     status: "planning",
-    currentSprint: 0,
-    totalSprints: 0,
-    completedSprints: 0,
+    currentSprint: resumedProgress?.currentSprint ?? 0,
+    totalSprints: resumedProgress?.totalSprints ?? 0,
+    completedSprints: resumedProgress?.completedSprints ?? 0,
     retryCount: 0,
   };
-  await writeProgress(config.workDir, progress);
-
-  const plannerResponse = await runPlanner(config.userPrompt, config.workDir);
-
-  // Planner may have written spec.md via Write tool, or returned it as text
-  let spec: string;
-  try {
-    spec = await readSpec(config.workDir);
-  } catch {
-    log("HARNESS", "Planner returned spec as text, writing to spec.md");
-    await writeSpec(config.workDir, plannerResponse);
-    spec = plannerResponse;
-  }
 
   // Parse sprint count from spec - look for "Sprint N" patterns
   const sprintNumbers = Array.from(spec.matchAll(/sprint\s+(\d+)/gi))
@@ -72,24 +110,44 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
     : 3; // Default to 3 if no sprint numbers found
 
   progress.totalSprints = totalSprints;
-  log("HARNESS", `Planner produced ${totalSprints} sprints`);
+  await writeProgress(config.workDir, progress);
 
-  // Phase 2-4: Sprint Loop
-  for (let sprint = 1; sprint <= totalSprints; sprint++) {
+  if (startSprint > totalSprints) {
+    log("HARNESS", "All sprints already completed in previous run!");
+    return { success: true, sprints: results, totalDurationMs: Date.now() - startTime };
+  }
+
+  log("HARNESS", `Spec has ${totalSprints} sprints${startSprint > 1 ? ` (starting from sprint ${startSprint})` : ""}`);
+
+  // ---- Phase 2-4: Sprint Loop ----
+  for (let sprint = startSprint; sprint <= totalSprints; sprint++) {
     logDivider();
     log("HARNESS", `SPRINT ${sprint}/${totalSprints}`);
     logDivider();
 
-    // Phase 2: Contract Negotiation
+    // Phase 2: Contract Negotiation — reuse saved contract on resume if available
     progress.status = "negotiating";
     progress.currentSprint = sprint;
     progress.retryCount = 0;
     await writeProgress(config.workDir, progress);
 
-    log("HARNESS", "Negotiating sprint contract...");
-    const contract = await negotiateContract(config.workDir, spec, sprint);
-    await writeContract(config.workDir, contract);
-    log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
+    let contract: SprintContract;
+    if (config.resume) {
+      try {
+        contract = await readContract(config.workDir, sprint);
+        log("HARNESS", `Reusing saved contract: ${contract.criteria.length} criteria for ${contract.features.length} features`);
+      } catch {
+        log("HARNESS", "No saved contract for this sprint — negotiating...");
+        contract = await negotiateContract(config.workDir, spec, sprint);
+        await writeContract(config.workDir, contract);
+        log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
+      }
+    } else {
+      log("HARNESS", "Negotiating sprint contract...");
+      contract = await negotiateContract(config.workDir, spec, sprint);
+      await writeContract(config.workDir, contract);
+      log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
+    }
 
     // Phase 3-4: Build-Evaluate Loop
     let passed = false;
@@ -104,13 +162,13 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
       progress.retryCount = retry;
       await writeProgress(config.workDir, progress);
 
-      await runGenerator(config.workDir, spec, contract, lastEval);
+      await runGenerator(config.workDir, appDir, spec, contract, lastEval);
 
       // Evaluate
       progress.status = "evaluating";
       await writeProgress(config.workDir, progress);
 
-      lastEval = await runEvaluator(config.workDir, contract, config.passThreshold);
+      lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold);
       await writeFeedback(config.workDir, sprint, retry, lastEval);
 
       if (lastEval.passed) {
@@ -153,7 +211,35 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
   log("HARNESS", `Harness ${allPassed ? "COMPLETED" : "FAILED"} in ${(totalDuration / 1000 / 60).toFixed(1)} minutes`);
   log("HARNESS", `Sprints: ${results.filter((r) => r.passed).length}/${results.length} passed`);
 
+  // Print token usage + cost summary collected across every claude -p call.
+  logDivider();
+  for (const line of formatUsageReport().split("\n")) {
+    log("HARNESS", line);
+  }
+
   return { success: allPassed, sprints: results, totalDurationMs: totalDuration };
+}
+
+async function planFromScratch(config: HarnessConfig): Promise<string> {
+  if (config.specFile) {
+    log("HARNESS", `Using provided spec: ${config.specFile}`);
+    const spec = await readFile(config.specFile, "utf-8");
+    await writeSpec(config.workDir, spec);
+    return spec;
+  } else if (config.specsDir) {
+    log("HARNESS", `Assembling spec from directory: ${config.specsDir}`);
+    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir);
+    return readSpec(config.workDir);
+  } else {
+    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir);
+    try {
+      return await readSpec(config.workDir);
+    } catch {
+      log("HARNESS", "Planner returned spec as text, writing to spec.md");
+      await writeSpec(config.workDir, plannerResponse);
+      return plannerResponse;
+    }
+  }
 }
 
 async function negotiateContract(
@@ -164,52 +250,46 @@ async function negotiateContract(
   // Generator proposes contract
   const proposalPrompt = `## Product Spec\n\n${spec}\n\n## Sprint Number: ${sprintNumber}\n\nPropose a sprint contract for this sprint.`;
 
-  const proposalOptions: Options = {
+  let proposalText = "";
+  for await (const msg of runClaude({
+    prompt: proposalPrompt,
     cwd: workDir,
     systemPrompt: CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
     tools: ["Read"],
     model: CLAUDE_MODEL,
     maxTurns: 10,
-    persistSession: false,
-  };
-
-  let proposalText = "";
-  for await (const msg of query({ prompt: proposalPrompt, options: proposalOptions })) {
+  })) {
     if (msg.type === "assistant") {
-      const message = msg as { message: { content: Array<{ type: string; text?: string }> } };
-      for (const block of message.message.content) {
-        if (block.type === "text" && block.text) {
+      for (const block of msg.message.content) {
+        if (block.type === "text") {
           proposalText += block.text;
         }
       }
+    } else if (msg.type === "result") {
+      recordClaudeResult(`CONTRACT/sprint ${sprintNumber} propose`, msg);
     }
   }
 
   // Evaluator reviews contract
   const reviewPrompt = `## Proposed Sprint Contract\n\n${proposalText}\n\nReview this contract.`;
 
-  const reviewOptions: Options = {
+  let reviewText = "";
+  for await (const msg of runClaude({
+    prompt: reviewPrompt,
     cwd: workDir,
     systemPrompt: CONTRACT_NEGOTIATION_EVALUATOR_PROMPT,
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
     tools: ["Read"],
     model: CLAUDE_MODEL,
     maxTurns: 10,
-    persistSession: false,
-  };
-
-  let reviewText = "";
-  for await (const msg of query({ prompt: reviewPrompt, options: reviewOptions })) {
+  })) {
     if (msg.type === "assistant") {
-      const message = msg as { message: { content: Array<{ type: string; text?: string }> } };
-      for (const block of message.message.content) {
-        if (block.type === "text" && block.text) {
+      for (const block of msg.message.content) {
+        if (block.type === "text") {
           reviewText += block.text;
         }
       }
+    } else if (msg.type === "result") {
+      recordClaudeResult(`CONTRACT/sprint ${sprintNumber} review`, msg);
     }
   }
 

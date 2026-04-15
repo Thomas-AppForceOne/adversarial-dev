@@ -6,6 +6,7 @@ import type { SprintContract, EvalResult } from "../shared/types.ts";
 
 export async function runEvaluator(
   workDir: string,
+  appDir: string,
   contract: SprintContract,
   passThreshold: number,
 ): Promise<EvalResult> {
@@ -22,13 +23,13 @@ Each criterion must score at least ${passThreshold}/10 to pass.
 
 ## Instructions
 
-Examine the application in the \`app/\` directory. Read the code, run it if possible, and score each criterion. Output ONLY the JSON evaluation object.`;
+Examine the application at ${appDir}. Read the code, run it if possible, and score each criterion. Output ONLY the JSON evaluation object.`;
 
   const fullPrompt = `${EVALUATOR_SYSTEM_PROMPT}\n\n---\n\n${taskPrompt}`;
 
   const codex = new Codex();
   const thread = codex.startThread({
-    workingDirectory: workDir,
+    workingDirectory: appDir,
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",

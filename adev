@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# adev — run adversarial-dev harness on the current project, inside Docker
+#
+# Usage (run from inside any project directory):
+#   adev "Add dark mode and CSV export"
+#   adev --spec ./SPEC.md
+#   adev --specs ./specs/
+#   ADEV_HARNESS=codex adev --specs ./specs/
+#
+# Auth (auto-detected, or force with ADEV_AUTH=api|subscription):
+#   API key:      export ANTHROPIC_API_KEY=sk-ant-...
+#   Subscription: just run — credentials are read from the macOS Keychain
+#
+# How it works:
+#   The container installs the real `claude` CLI and spawns `claude -p` for
+#   every planner/generator/evaluator turn. Auth is handled by Claude Code
+#   itself (either ANTHROPIC_API_KEY or a mounted OAuth credentials file),
+#   which means Anthropic sees legitimate Claude Code traffic and tokens
+#   refresh automatically inside the binary.
+#
+# Note on subscription mode:
+#   Claude Code inside the container may rotate your OAuth refresh token
+#   while it runs. The mounted credentials file ($CRED_FILE) is a COPY of
+#   the host Keychain entry, NOT the Keychain itself, so a running adev
+#   session won't corrupt your host `claude` login — but if the refresh
+#   token ends up rotated, your next host `claude` invocation may need to
+#   re-authenticate. This is fine; just run `claude` once to re-login.
+#
+
+set -euo pipefail
+
+# ---- Helper functions (must be defined before use) ----
+
+# Canonicalize a path (resolve symlinks, collapse ../ and ./, make absolute).
+# Works for non-existent paths too. Uses Python which is guaranteed present on
+# macOS; falls back to GNU `realpath -m` on Linux, then BSD `realpath`.
+canonicalize() {
+  local p="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p"
+  elif realpath -m / >/dev/null 2>&1; then
+    realpath -m "$p"
+  else
+    # BSD realpath needs the path to exist; fall back to best-effort if not.
+    realpath "$p" 2>/dev/null || printf '%s' "$p"
+  fi
+}
+
+# Translate a host path into the container-side /project/... equivalent.
+# Refuses paths outside $PROJECT_DIR.
+translate_path() {
+  local p="$1"
+  [[ "$p" != /* ]] && p="$PROJECT_DIR/$p"
+  p="$(canonicalize "$p")"
+  if [[ "$p" == "$PROJECT_DIR" || "$p" == "$PROJECT_DIR"/* ]]; then
+    local rel="${p#"$PROJECT_DIR"}"; rel="${rel#/}"
+    [[ -z "$rel" ]] && printf '/project' || printf '/project/%s' "$rel"
+  else
+    echo "adev: '$1' is outside the current project — refusing to mount." >&2
+    echo "      resolved path: $p" >&2
+    echo "      project dir:   $PROJECT_DIR" >&2
+    echo "      Use ADEV_EXTRA_MOUNT=host:container[:opts] to mount additional paths." >&2
+    exit 1
+  fi
+}
+
+# Extract Claude subscription credentials to $CRED_FILE.
+extract_subscription_creds() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if ! security find-generic-password -s "Claude Code-credentials" -w >"$CRED_FILE" 2>/dev/null; then
+      echo "adev: no Claude subscription credentials found in macOS Keychain." >&2
+      echo "      Run 'claude' to log in, or export ANTHROPIC_API_KEY." >&2
+      exit 1
+    fi
+  else
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+      cp "$HOME/.claude/.credentials.json" "$CRED_FILE"
+    else
+      echo "adev: ~/.claude/.credentials.json not found. Run 'claude' to log in, or export ANTHROPIC_API_KEY." >&2
+      exit 1
+    fi
+  fi
+  chmod 600 "$CRED_FILE"
+}
+
+# ---- Configuration ----
+
+HARNESS_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+COMPOSE_FILE="$HARNESS_DIR/compose.yml"
+
+IMAGE_AGENT="${ADEV_IMAGE_AGENT:-adversarial-dev}"
+HARNESS="${ADEV_HARNESS:-claude}"   # claude | codex
+
+PROJECT_DIR="$(pwd -P)"
+WORKSPACE_DIR="$PROJECT_DIR/.adev-workspace"
+CRED_FILE="$HOME/.adev/container-creds/.credentials.json"
+
+mkdir -p "$WORKSPACE_DIR"
+mkdir -p "$(dirname "$CRED_FILE")"
+chmod 700 "$(dirname "$CRED_FILE")"
+
+# ---- Sanity checks ----
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "adev: 'docker' is required but not found" >&2; exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "adev: Docker is not running" >&2; exit 1
+fi
+
+# ---- Parse arguments ----
+
+declare -a TRANSLATED=()
+HAS_TARGET=false
+
+i=0
+args=("$@")
+while [[ $i -lt ${#args[@]} ]]; do
+  a="${args[$i]}"
+  case "$a" in
+    --spec|-s|--specs|--file|-f)
+      TRANSLATED+=("$a")
+      i=$((i+1))
+      [[ $i -ge ${#args[@]} ]] && { echo "adev: $a requires a path argument" >&2; exit 1; }
+      TRANSLATED+=("$(translate_path "${args[$i]}")")
+      ;;
+    --target|-t)
+      HAS_TARGET=true
+      TRANSLATED+=("$a")
+      i=$((i+1))
+      [[ $i -ge ${#args[@]} ]] && { echo "adev: $a requires a path argument" >&2; exit 1; }
+      TRANSLATED+=("$(translate_path "${args[$i]}")")
+      ;;
+    --resume|-r)
+      TRANSLATED+=("--resume")
+      ;;
+    *)
+      TRANSLATED+=("$a")
+      ;;
+  esac
+  i=$((i+1))
+done
+
+# Check for --resume (it's already in TRANSLATED if present)
+HAS_RESUME=false
+for a in "${TRANSLATED[@]}"; do [[ "$a" == "--resume" ]] && HAS_RESUME=true; done
+
+# Require at least a prompt (or --spec/--specs/--resume, which need no positional args)
+if [[ ${#TRANSLATED[@]} -eq 0 ]] && ! $HAS_TARGET; then
+  echo "Usage: adev <prompt>" >&2
+  echo "       adev --spec <file>" >&2
+  echo "       adev --specs <dir>" >&2
+  echo "       adev --resume                       # continue interrupted run" >&2
+  echo "       adev --target <dir> <prompt>" >&2
+  echo "       adev --target <dir> --spec <file>" >&2
+  echo "       adev --resume --specs <dir>          # resume with spec source" >&2
+  exit 1
+fi
+
+# Auto-inject --target /project unless the user specified one
+$HAS_TARGET || TRANSLATED=(--target /project "${TRANSLATED[@]}")
+
+# ---- Authentication ----
+# Claude Code inside the container handles auth itself. We just need to
+# supply either an API key (env) or a credentials file (mount).
+
+ADEV_AUTH="${ADEV_AUTH:-auto}"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+
+if [[ "$HARNESS" == "claude" ]]; then
+  case "$ADEV_AUTH" in
+    api)
+      [[ -z "$ANTHROPIC_API_KEY" ]] && { echo "adev: ADEV_AUTH=api requires ANTHROPIC_API_KEY" >&2; exit 1; }
+      # Empty placeholder file so the compose mount doesn't fail.
+      touch "$CRED_FILE" && chmod 600 "$CRED_FILE"
+      ;;
+    subscription)
+      ANTHROPIC_API_KEY=""
+      extract_subscription_creds
+      ;;
+    auto)
+      if [[ -n "$ANTHROPIC_API_KEY" ]]; then
+        touch "$CRED_FILE" && chmod 600 "$CRED_FILE"
+      else
+        extract_subscription_creds
+      fi
+      ;;
+  esac
+fi
+
+# ---- Build image if not present ----
+
+if ! docker image inspect "$IMAGE_AGENT" >/dev/null 2>&1; then
+  echo "adev: building agent image (first run, installs claude CLI)..."
+  docker build -t "$IMAGE_AGENT" "$HARNESS_DIR"
+fi
+
+# ---- Export variables for docker compose ----
+
+export ANTHROPIC_API_KEY
+export CRED_FILE
+export PROJECT_DIR
+export WORKSPACE_DIR
+export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+# Unique name prevents collisions when running from different dirs simultaneously
+export COMPOSE_PROJECT_NAME="adev-$$"
+
+# ---- Run ----
+
+EXTRA_VOLUME_ARGS=()
+[[ -n "${ADEV_EXTRA_MOUNT:-}" ]] && EXTRA_VOLUME_ARGS=(-v "$ADEV_EXTRA_MOUNT")
+
+# Cleanup on any exit.
+trap 'docker compose -f "$COMPOSE_FILE" --project-name "$COMPOSE_PROJECT_NAME" down --timeout 5 2>/dev/null || true' EXIT INT TERM
+
+exec docker compose -f "$COMPOSE_FILE" \
+  --project-name "$COMPOSE_PROJECT_NAME" \
+  run --rm \
+  "${EXTRA_VOLUME_ARGS[@]}" \
+  agent \
+  "${HARNESS}-harness/index.ts" \
+  "${TRANSLATED[@]}"
