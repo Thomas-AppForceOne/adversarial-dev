@@ -17,7 +17,10 @@
  *   the successful (or final) attempt.
  */
 
-import { log, logError } from "./logger.ts";
+import { log, logError, logToolTiming, ToolTimeoutError } from "./logger.ts";
+import { CLAUDE_TOOL_TIMEOUT_MS } from "./config.ts";
+
+export { ToolTimeoutError };
 
 export type ContentBlock =
   | { type: "text"; text: string }
@@ -57,6 +60,24 @@ export interface RunClaudeOptions {
   model: string;
   /** Max agent turns before claude stops the loop. */
   maxTurns?: number;
+  /**
+   * Per-tool-call wall-clock timeout in milliseconds. Defaults to
+   * `CLAUDE_TOOL_TIMEOUT_MS` (15 min unless `ADEV_TOOL_TIMEOUT_SEC` is set).
+   * When a tool_use has no matching tool_result within this window, the
+   * subprocess is SIGKILL'd and a `ToolTimeoutError` is thrown.
+   */
+  toolCallTimeoutMs?: number;
+  /**
+   * Role label for tool-timing log lines (e.g. "PLANNER", "GENERATOR/sprint
+   * 1"). Used only for observability; safe to omit.
+   */
+  role?: string;
+  /**
+   * Directory where `tool-timings.jsonl` is appended. Usually
+   * `config.workDir`. If unset, per-tool timings are still measured and
+   * logged to stdout but not persisted.
+   */
+  timingsDir?: string;
 }
 
 // ---- Quota / rate-limit detection & retry ----
@@ -206,39 +227,136 @@ async function execClaude(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  // @ts-expect-error Bun's ReadableStream is async-iterable in practice.
-  for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    let nl: number;
-    while ((nl = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const parsed = JSON.parse(line) as ClaudeMessage;
-        if (parsed.type === "result") sawResult = true;
-        if (parsed.type === "system" && parsed.subtype === "init") {
-          log("CLAUDE-CLI", `claude session init: cwd=${(parsed as any).cwd ?? "?"} session=${(parsed as any).session_id?.slice(0, 8) ?? "?"}`);
+  // ---- Per-tool-call timeout state ----
+  // Each entry tracks one in-flight tool_use. When the matching tool_result
+  // arrives we clear the timer and emit a timing record. If the timer fires
+  // first, we SIGKILL the subprocess so `proc.exited` resolves and the stream
+  // loop exits; the outer try/finally then sees `timedOutTool` and throws.
+  const timeoutMs = opts.toolCallTimeoutMs ?? CLAUDE_TOOL_TIMEOUT_MS;
+  type PendingTool = {
+    name: string;
+    startedAtMs: number;
+    timer: ReturnType<typeof setTimeout>;
+  };
+  const openTools = new Map<string, PendingTool>();
+  // Wrap the "timed out" signal in a box so TS doesn't narrow a bare `let`
+  // variable to `null` (it can't see across the setTimeout callback).
+  const timeoutRef: {
+    value: { name: string; toolUseId: string; elapsedMs: number } | null;
+  } = { value: null };
+  let latestSessionId: string | undefined;
+
+  const fireTimeout = (toolUseId: string, name: string, startedAtMs: number) => {
+    const elapsedMs = Date.now() - startedAtMs;
+    timeoutRef.value = { name, toolUseId, elapsedMs };
+    logError(
+      "CLAUDE-CLI",
+      `tool '${name}' (id ${toolUseId.slice(0, 12)}) exceeded ${timeoutMs}ms — killing subprocess`,
+    );
+    if (opts.timingsDir) {
+      logToolTiming(opts.timingsDir, {
+        role: opts.role ?? "unknown",
+        sessionId: latestSessionId,
+        tool: name,
+        durationMs: elapsedMs,
+        timedOut: true,
+      });
+    }
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      /* process may already be dead */
+    }
+  };
+
+  const handleToolUse = (block: Extract<ContentBlock, { type: "tool_use" }>) => {
+    // Defensive: if we somehow see a duplicate tool_use id, reset the timer.
+    const existing = openTools.get(block.id);
+    if (existing) clearTimeout(existing.timer);
+    const startedAtMs = Date.now();
+    const timer = setTimeout(() => fireTimeout(block.id, block.name, startedAtMs), timeoutMs);
+    openTools.set(block.id, { name: block.name, startedAtMs, timer });
+  };
+
+  const handleToolResult = (block: Extract<ContentBlock, { type: "tool_result" }>) => {
+    const pending = openTools.get(block.tool_use_id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    openTools.delete(block.tool_use_id);
+    const durationMs = Date.now() - pending.startedAtMs;
+    if (opts.timingsDir) {
+      logToolTiming(opts.timingsDir, {
+        role: opts.role ?? "unknown",
+        sessionId: latestSessionId,
+        tool: pending.name,
+        durationMs,
+      });
+    }
+  };
+
+  try {
+    for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as ClaudeMessage;
+          if (parsed.type === "result") sawResult = true;
+          if (parsed.type === "system" && parsed.subtype === "init") {
+            latestSessionId = (parsed as any).session_id;
+            log(
+              "CLAUDE-CLI",
+              `claude session init: cwd=${(parsed as any).cwd ?? "?"} session=${latestSessionId?.slice(0, 8) ?? "?"}`,
+            );
+          }
+          // Track tool_use → tool_result for timeouts + per-tool timings.
+          if (parsed.type === "assistant") {
+            for (const block of parsed.message.content) {
+              if (block.type === "tool_use") handleToolUse(block);
+            }
+          } else if (parsed.type === "user") {
+            for (const block of parsed.message.content) {
+              if (block.type === "tool_result") handleToolResult(block);
+            }
+          }
+          messages.push(parsed);
+        } catch (e) {
+          logError("CLAUDE-CLI", `failed to parse stream-json line: ${line.slice(0, 200)}`);
         }
-        messages.push(parsed);
-      } catch (e) {
-        logError("CLAUDE-CLI", `failed to parse stream-json line: ${line.slice(0, 200)}`);
       }
     }
-  }
-  const tail = buffer.trim();
-  if (tail) {
-    try {
-      const parsed = JSON.parse(tail) as ClaudeMessage;
-      if (parsed.type === "result") sawResult = true;
-      messages.push(parsed);
-    } catch {
-      /* ignore trailing noise */
+    const tail = buffer.trim();
+    if (tail) {
+      try {
+        const parsed = JSON.parse(tail) as ClaudeMessage;
+        if (parsed.type === "result") sawResult = true;
+        messages.push(parsed);
+      } catch {
+        /* ignore trailing noise */
+      }
     }
+  } finally {
+    // Cancel every pending timer; otherwise they'd fire after we return and
+    // try to kill a subprocess that may have already been reused (or, worse,
+    // nothing, keeping the event loop alive).
+    for (const p of openTools.values()) clearTimeout(p.timer);
+    openTools.clear();
   }
 
   const exitCode = await proc.exited;
   const stderr = await new Response(proc.stderr).text();
+
+  if (timeoutRef.value) {
+    throw new ToolTimeoutError(
+      timeoutRef.value.name,
+      timeoutRef.value.toolUseId,
+      timeoutRef.value.elapsedMs,
+      timeoutMs,
+    );
+  }
 
   return { messages, sawResult, exitCode, stderr };
 }

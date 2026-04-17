@@ -1,5 +1,5 @@
 import { EVALUATOR_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CLAUDE_MODEL, CLAUDE_MAX_TURNS } from "../shared/config.ts";
+import { CLAUDE_MAX_TURNS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 import { runClaude } from "../shared/claude-cli.ts";
 import { recordClaudeResult } from "../shared/usage.ts";
@@ -10,6 +10,7 @@ export async function runEvaluator(
   appDir: string,
   contract: SprintContract,
   passThreshold: number,
+  model: string,
 ): Promise<EvalResult> {
   const sprint = contract.sprintNumber;
   log("EVALUATOR", `Evaluating sprint ${sprint} against ${contract.criteria.length} criteria`);
@@ -35,8 +36,10 @@ Examine the application at ${appDir}. Read the code, run it if possible, and sco
     cwd: appDir,
     systemPrompt: EVALUATOR_SYSTEM_PROMPT,
     tools: ["Read", "Bash", "Glob", "Grep"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: CLAUDE_MAX_TURNS,
+    role: `EVALUATOR/sprint ${sprint}`,
+    timingsDir: workDir,
   })) {
     if (msg.type === "assistant") {
       for (const block of msg.message.content) {

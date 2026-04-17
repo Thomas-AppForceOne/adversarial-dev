@@ -1,9 +1,9 @@
 import { Codex } from "@openai/codex-sdk";
 import { PLANNER_SYSTEM_PROMPT, PLANNER_SPECS_DIR_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CODEX_MODEL, CODEX_NETWORK_ACCESS } from "../shared/config.ts";
+import { CODEX_NETWORK_ACCESS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 
-export async function runPlanner(userPrompt: string, workDir: string, appDir?: string): Promise<string> {
+export async function runPlanner(userPrompt: string, workDir: string, appDir: string | undefined, model: string): Promise<string> {
   log("PLANNER", `Starting planning for: "${userPrompt}"`);
 
   const codex = new Codex();
@@ -12,7 +12,7 @@ export async function runPlanner(userPrompt: string, workDir: string, appDir?: s
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   const existingContext = appDir
@@ -32,7 +32,7 @@ export async function runPlanner(userPrompt: string, workDir: string, appDir?: s
   return turn.finalResponse;
 }
 
-export async function runPlannerFromSpecsDir(specsDir: string, workDir: string, appDir?: string): Promise<void> {
+export async function runPlannerFromSpecsDir(specsDir: string, workDir: string, appDir: string | undefined, model: string): Promise<void> {
   log("PLANNER", `Building spec from directory: ${specsDir}`);
 
   const existingContext = appDir
@@ -55,7 +55,7 @@ Discover all .md files in that directory (including subdirectories). Check for a
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   const turn = await thread.run(prompt);

@@ -4,8 +4,7 @@ import {
   CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
   CONTRACT_NEGOTIATION_EVALUATOR_PROMPT,
 } from "../shared/prompts.ts";
-import { CLAUDE_MODEL } from "../shared/config.ts";
-import { runClaude } from "../shared/claude-cli.ts";
+import { runClaude, ToolTimeoutError } from "../shared/claude-cli.ts";
 import { recordClaudeResult, formatUsageReport } from "../shared/usage.ts";
 import { log, logError, logDivider } from "../shared/logger.ts";
 import {
@@ -84,11 +83,11 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
       log("HARNESS", "PHASE 1: PLANNING (reusing existing spec.md)");
     } catch {
       log("HARNESS", "PHASE 1: PLANNING (spec.md not found, re-running planner)");
-      spec = await planFromScratch(config);
+      spec = await planFromScratch(config, config.modelLow);
     }
   } else {
     log("HARNESS", "PHASE 1: PLANNING");
-    spec = await planFromScratch(config);
+    spec = await planFromScratch(config, config.modelLow);
   }
 
   logDivider();
@@ -138,13 +137,13 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
         log("HARNESS", `Reusing saved contract: ${contract.criteria.length} criteria for ${contract.features.length} features`);
       } catch {
         log("HARNESS", "No saved contract for this sprint — negotiating...");
-        contract = await negotiateContract(config.workDir, spec, sprint);
+        contract = await negotiateContract(config.workDir, spec, sprint, config.modelLow);
         await writeContract(config.workDir, contract);
         log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
       }
     } else {
       log("HARNESS", "Negotiating sprint contract...");
-      contract = await negotiateContract(config.workDir, spec, sprint);
+      contract = await negotiateContract(config.workDir, spec, sprint, config.modelLow);
       await writeContract(config.workDir, contract);
       log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
     }
@@ -162,16 +161,44 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
       progress.retryCount = retry;
       await writeProgress(config.workDir, progress);
 
-      await runGenerator(config.workDir, appDir, spec, contract, lastEval);
+      try {
+        await runGenerator(config.workDir, appDir, spec, contract, config.modelHigh, lastEval);
 
-      // Evaluate
-      progress.status = "evaluating";
-      await writeProgress(config.workDir, progress);
+        // Evaluate
+        progress.status = "evaluating";
+        await writeProgress(config.workDir, progress);
 
-      lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold);
-      await writeFeedback(config.workDir, sprint, retry, lastEval);
+        lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold, config.modelLow);
+        await writeFeedback(config.workDir, sprint, retry, lastEval);
+      } catch (err) {
+        // Tool timeouts are an expected failure mode — they mean a generated
+        // subprocess hung. Treat the attempt as failed and let the retry
+        // loop re-attempt. Everything else still propagates.
+        if (!(err instanceof ToolTimeoutError)) throw err;
 
-      if (lastEval.passed) {
+        logError(
+          "HARNESS",
+          `Sprint ${sprint} attempt ${attempts} hit tool timeout: ${err.message}`,
+        );
+        lastEval = {
+          passed: false,
+          scores: {},
+          feedback: [
+            {
+              criterion: "tool_timeout",
+              score: 0,
+              details:
+                `Tool '${err.tool}' exceeded ${err.timeoutMs}ms wall-clock timeout ` +
+                `(ran ${err.elapsedMs}ms) during this attempt. The claude subprocess was ` +
+                `killed. Retry will start from a fresh session.`,
+            },
+          ],
+          overallSummary: `Attempt ${attempts} aborted by per-tool timeout on '${err.tool}'.`,
+        };
+        await writeFeedback(config.workDir, sprint, retry, lastEval);
+      }
+
+      if (lastEval && lastEval.passed) {
         passed = true;
         log("HARNESS", `Sprint ${sprint} PASSED on attempt ${attempts}`);
         break;
@@ -220,7 +247,7 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
   return { success: allPassed, sprints: results, totalDurationMs: totalDuration };
 }
 
-async function planFromScratch(config: HarnessConfig): Promise<string> {
+async function planFromScratch(config: HarnessConfig, model: string): Promise<string> {
   if (config.specFile) {
     log("HARNESS", `Using provided spec: ${config.specFile}`);
     const spec = await readFile(config.specFile, "utf-8");
@@ -228,10 +255,10 @@ async function planFromScratch(config: HarnessConfig): Promise<string> {
     return spec;
   } else if (config.specsDir) {
     log("HARNESS", `Assembling spec from directory: ${config.specsDir}`);
-    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir);
+    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir, model);
     return readSpec(config.workDir);
   } else {
-    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir);
+    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir, model);
     try {
       return await readSpec(config.workDir);
     } catch {
@@ -246,6 +273,7 @@ async function negotiateContract(
   workDir: string,
   spec: string,
   sprintNumber: number,
+  model: string,
 ): Promise<SprintContract> {
   // Generator proposes contract
   const proposalPrompt = `## Product Spec\n\n${spec}\n\n## Sprint Number: ${sprintNumber}\n\nPropose a sprint contract for this sprint.`;
@@ -256,8 +284,10 @@ async function negotiateContract(
     cwd: workDir,
     systemPrompt: CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
     tools: ["Read"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: 10,
+    role: `CONTRACT/sprint ${sprintNumber} propose`,
+    timingsDir: workDir,
   })) {
     if (msg.type === "assistant") {
       for (const block of msg.message.content) {
@@ -279,8 +309,10 @@ async function negotiateContract(
     cwd: workDir,
     systemPrompt: CONTRACT_NEGOTIATION_EVALUATOR_PROMPT,
     tools: ["Read"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: 10,
+    role: `CONTRACT/sprint ${sprintNumber} review`,
+    timingsDir: workDir,
   })) {
     if (msg.type === "assistant") {
       for (const block of msg.message.content) {
@@ -293,21 +325,35 @@ async function negotiateContract(
     }
   }
 
-  // Parse the final contract (either the proposal if approved, or the revised version)
-  const contractSource = reviewText.trim() === "APPROVED" ? proposalText : reviewText;
-  return parseContract(contractSource, sprintNumber);
+  // Bail early if neither agent produced anything useful (e.g. model error).
+  if (!proposalText.includes("{") && !reviewText.includes("{")) {
+    const detail = proposalText || reviewText || "(empty response)";
+    throw new Error(`Contract negotiation failed — agents returned no JSON. Response: ${detail.slice(0, 300)}`);
+  }
+
+  // "APPROVED" means use the proposal as-is. Accept minor variations (trailing
+  // punctuation, case differences) to avoid fragile exact-string matching.
+  const isApproved = /^approved[.!]?$/i.test(reviewText.trim());
+  const contractSource = isApproved ? proposalText : reviewText;
+
+  const contract = parseContract(contractSource, sprintNumber, proposalText);
+  return contract;
 }
 
-function parseContract(text: string, sprintNumber: number): SprintContract {
-  // Try multiple extraction strategies
+function parseContract(text: string, sprintNumber: number, fallbackText?: string): SprintContract {
+  // Try multiple extraction strategies across the primary text and an optional fallback
+  const sources = fallbackText ? [text, fallbackText] : [text];
   const candidates: string[] = [];
-  const codeBlocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
-  for (const match of codeBlocks.reverse()) {
-    if (match[1]) candidates.push(match[1].trim());
+
+  for (const src of sources) {
+    const codeBlocks = [...src.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+    for (const match of codeBlocks.reverse()) {
+      if (match[1]) candidates.push(match[1].trim());
+    }
+    const braceMatch = src.match(/\{[\s\S]*"criteria"[\s\S]*\}/);
+    if (braceMatch) candidates.push(braceMatch[0]);
+    candidates.push(src.trim());
   }
-  const braceMatch = text.match(/\{[\s\S]*"criteria"[\s\S]*\}/);
-  if (braceMatch) candidates.push(braceMatch[0]);
-  candidates.push(text.trim());
 
   for (const candidate of candidates) {
     try {
@@ -323,6 +369,8 @@ function parseContract(text: string, sprintNumber: number): SprintContract {
 
   {
     logError("HARNESS", "Failed to parse contract JSON, creating default");
+    logError("HARNESS", `Primary response (${text.length} chars): ${text.slice(0, 300)}`);
+    if (fallbackText) logError("HARNESS", `Fallback response (${fallbackText.length} chars): ${fallbackText.slice(0, 300)}`);
     return {
       sprintNumber,
       features: [`Sprint ${sprintNumber} features`],

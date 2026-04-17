@@ -19,16 +19,140 @@
 #   which means Anthropic sees legitimate Claude Code traffic and tokens
 #   refresh automatically inside the binary.
 #
-# Note on subscription mode:
-#   Claude Code inside the container may rotate your OAuth refresh token
-#   while it runs. The mounted credentials file ($CRED_FILE) is a COPY of
-#   the host Keychain entry, NOT the Keychain itself, so a running adev
-#   session won't corrupt your host `claude` login — but if the refresh
-#   token ends up rotated, your next host `claude` invocation may need to
-#   re-authenticate. This is fine; just run `claude` once to re-login.
+# Note on subscription mode — OAuth concurrency:
+#   OAuth refresh tokens are ONE-TIME-USE. When Claude Code refreshes a
+#   token, the old refresh token is consumed and replaced with a new one.
+#   Both the container (via `adev`) and your host `claude` session read
+#   from the same macOS Keychain entry ("Claude Code-credentials"), so
+#   they share a single refresh token. If either side refreshes, the
+#   other side's cached copy becomes invalid and its next API call will
+#   return 401 Unauthorized.
+#
+#   `adev` copies credentials out of the Keychain at container start and
+#   syncs any rotated tokens BACK to the Keychain when the container
+#   exits cleanly. This makes SEQUENTIAL adev runs work: run 1 rotates,
+#   syncs back, run 2 picks up fresh tokens, etc. It does NOT prevent
+#   CONCURRENT access from breaking the chain.
+#
+#   Known failure modes:
+#     1. Host `claude` (Claude Code IDE / VS Code / Terminal) running at
+#        the same time as a long adev run — if either side refreshes
+#        its tokens while the other is using the old ones, the other
+#        side gets 401 on its next refresh.
+#     2. Two `adev` invocations running concurrently — the second one's
+#        extract-from-Keychain may happen before the first syncs back.
+#
+#   Mitigations, ordered by robustness:
+#     A. Set `ANTHROPIC_API_KEY` before running adev. API keys are not
+#        one-time-use, so no concurrency issue. Billed per-request
+#        against the API key owner; bypasses subscription entirely.
+#          export ANTHROPIC_API_KEY=sk-ant-...
+#          adev "..."
+#     B. Close host `claude` sessions (VS Code extension, Claude Code,
+#        terminal claude) before kicking off a long adev run.
+#     C. Don't run two adev invocations concurrently on the same host.
+#     D. If a 401 appears anywhere, run `claude` on the host once to
+#        re-authenticate. The next adev run will pick up the fresh
+#        tokens on the next extract.
 #
 
 set -euo pipefail
+
+# ---- Fast path: --models needs no Docker, auth, or project context ----
+
+CLAUDE_MODELS=(
+  claude-opus-4-6
+  claude-sonnet-4-6
+  claude-haiku-4-5-20251001
+  claude-3-5-sonnet-20241022
+  claude-3-5-haiku-20241022
+  claude-3-opus-20240229
+)
+CODEX_MODELS=(
+  gpt-5.4
+  gpt-4o
+  gpt-4o-mini
+  o4-mini
+  o3
+  o3-mini
+)
+
+for a in "$@"; do
+  if [[ "$a" == "--models" ]]; then
+    echo "The harness uses two model tiers:"
+    echo "  high  = Generator (heavy code reasoning)"
+    echo "  low   = Planner, contract negotiation, Evaluator"
+    echo ""
+    echo "Claude models (default: ${CLAUDE_MODELS[0]}):"
+    for m in "${CLAUDE_MODELS[@]}"; do echo "  $m"; done
+    echo ""
+    echo "Codex models (default: ${CODEX_MODELS[0]}):"
+    for m in "${CODEX_MODELS[@]}"; do echo "  $m"; done
+    echo ""
+    echo "Usage: adev --model <model>                       # same model for both tiers"
+    echo "       adev --model-high <model> --model-low <model>   # split tiers"
+    echo "       ADEV_HARNESS=codex adev --model <model> ..."
+    exit 0
+  fi
+done
+
+# --set-model / --set-model-high / --set-model-low: write project default into .adev/config.json
+case "${1:-}" in
+  --set-model|--set-model-high|--set-model-low)
+    FLAG="$1"
+    MODEL="${2:-}"
+    if [[ -z "$MODEL" ]]; then
+      echo "adev: $FLAG requires a model name" >&2
+      echo "      Run 'adev --models' to see valid options." >&2
+      exit 1
+    fi
+    HARNESS="${ADEV_HARNESS:-claude}"
+    CONFIG_FILE="$(pwd -P)/.adev/config.json"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    # Which provider prefix?
+    if [[ "$HARNESS" == "claude" ]]; then
+      PREFIX="claudeModel"
+      VALID=("${CLAUDE_MODELS[@]}")
+    else
+      PREFIX="codexModel"
+      VALID=("${CODEX_MODELS[@]}")
+    fi
+
+    # Which tier suffix?
+    case "$FLAG" in
+      --set-model)      KEY="${PREFIX}" ;;       # shorthand — both tiers
+      --set-model-high) KEY="${PREFIX}High" ;;
+      --set-model-low)  KEY="${PREFIX}Low" ;;
+    esac
+
+    FOUND=false
+    for m in "${VALID[@]}"; do [[ "$m" == "$MODEL" ]] && FOUND=true && break; done
+    if ! $FOUND; then
+      echo "adev: '$MODEL' is not a valid ${HARNESS} model." >&2
+      echo "      Valid models: ${VALID[*]}" >&2
+      echo "      Run 'adev --models' for details." >&2
+      exit 1
+    fi
+
+    python3 - "$CONFIG_FILE" "$KEY" "$MODEL" <<'PYEOF'
+import sys, json, os
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {}
+if os.path.exists(path):
+    with open(path) as f:
+        try: cfg = json.load(f)
+        except: pass
+cfg[key] = value
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+print(f"Set default {key} = {value}")
+print(f"Written to {path}")
+PYEOF
+    exit 0
+    ;;
+esac
 
 # ---- Helper functions (must be defined before use) ----
 
@@ -73,6 +197,10 @@ extract_subscription_creds() {
       echo "      Run 'claude' to log in, or export ANTHROPIC_API_KEY." >&2
       exit 1
     fi
+    # Remember the Keychain account name so we can write the rotated creds back.
+    CRED_ACCOUNT=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null \
+                   | awk -F\" '/"acct"<blob>/{print $4; exit}')
+    [[ -z "$CRED_ACCOUNT" ]] && CRED_ACCOUNT="$USER"
   else
     if [[ -f "$HOME/.claude/.credentials.json" ]]; then
       cp "$HOME/.claude/.credentials.json" "$CRED_FILE"
@@ -81,7 +209,46 @@ extract_subscription_creds() {
       exit 1
     fi
   fi
+  # Capture the mtime after extraction so we can tell whether Claude Code
+  # rotated the tokens during the run.
+  CRED_MTIME_BEFORE=$(stat -f %m "$CRED_FILE" 2>/dev/null || stat -c %Y "$CRED_FILE" 2>/dev/null || echo 0)
   chmod 600 "$CRED_FILE"
+}
+
+# Write (possibly rotated) credentials from $CRED_FILE back to the host
+# credential store. Claude Code inside the container may refresh the OAuth
+# tokens during a long run; if we don't sync the new refresh token back,
+# the next adev invocation will extract a stale token from the host and
+# fail with HTTP 401.
+sync_creds_to_host() {
+  # Only meaningful in subscription mode.
+  [[ "$ADEV_AUTH" == "api" ]] && return 0
+  [[ -z "$ANTHROPIC_API_KEY" ]] || return 0
+  [[ ! -s "$CRED_FILE" ]] && return 0
+
+  # Skip if Claude Code didn't touch the file (no rotation happened).
+  local mtime_after
+  mtime_after=$(stat -f %m "$CRED_FILE" 2>/dev/null || stat -c %Y "$CRED_FILE" 2>/dev/null || echo 0)
+  [[ "$mtime_after" == "${CRED_MTIME_BEFORE:-0}" ]] && return 0
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local acct="${CRED_ACCOUNT:-$USER}"
+    if security add-generic-password \
+         -s "Claude Code-credentials" \
+         -a "$acct" \
+         -w "$(cat "$CRED_FILE")" \
+         -U 2>/dev/null; then
+      echo "adev: synced rotated Claude tokens back to macOS Keychain." >&2
+    else
+      echo "adev: warning — could not write rotated Claude tokens back to Keychain." >&2
+      echo "      If the next run fails with 401, re-run 'claude' to re-authenticate." >&2
+    fi
+  else
+    if cp "$CRED_FILE" "$HOME/.claude/.credentials.json" 2>/dev/null; then
+      chmod 600 "$HOME/.claude/.credentials.json" 2>/dev/null || true
+      echo "adev: synced rotated Claude tokens back to ~/.claude/.credentials.json" >&2
+    fi
+  fi
 }
 
 # ---- Configuration ----
@@ -155,6 +322,12 @@ if [[ ${#TRANSLATED[@]} -eq 0 ]] && ! $HAS_TARGET; then
   echo "       adev --target <dir> <prompt>" >&2
   echo "       adev --target <dir> --spec <file>" >&2
   echo "       adev --resume --specs <dir>          # resume with spec source" >&2
+  echo "       adev --model <model>                              # same model for both tiers (this run)" >&2
+  echo "       adev --model-high <model> --model-low <model>     # split tiers (this run)" >&2
+  echo "       adev --set-model <model>                          # save project default for both tiers" >&2
+  echo "       adev --set-model-high <model>                     # save project default for generator only" >&2
+  echo "       adev --set-model-low <model>                      # save project default for planner/contract/evaluator" >&2
+  echo "       adev --models                                     # list available models and exit" >&2
   exit 1
 fi
 
@@ -203,6 +376,11 @@ export CRED_FILE
 export PROJECT_DIR
 export WORKSPACE_DIR
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+# Forward harness tuning knobs so users can override defaults via env:
+#   ADEV_TOOL_TIMEOUT_SEC, ADEV_QUOTA_MAX_RETRIES, ADEV_QUOTA_WAIT_MS
+export ADEV_TOOL_TIMEOUT_SEC="${ADEV_TOOL_TIMEOUT_SEC:-}"
+export ADEV_QUOTA_MAX_RETRIES="${ADEV_QUOTA_MAX_RETRIES:-}"
+export ADEV_QUOTA_WAIT_MS="${ADEV_QUOTA_WAIT_MS:-}"
 # Unique name prevents collisions when running from different dirs simultaneously
 export COMPOSE_PROJECT_NAME="adev-$$"
 
@@ -211,13 +389,21 @@ export COMPOSE_PROJECT_NAME="adev-$$"
 EXTRA_VOLUME_ARGS=()
 [[ -n "${ADEV_EXTRA_MOUNT:-}" ]] && EXTRA_VOLUME_ARGS=(-v "$ADEV_EXTRA_MOUNT")
 
-# Cleanup on any exit.
-trap 'docker compose -f "$COMPOSE_FILE" --project-name "$COMPOSE_PROJECT_NAME" down --timeout 5 2>/dev/null || true' EXIT INT TERM
+# Cleanup on any exit: tear down the compose stack and sync rotated OAuth
+# tokens back to the host credential store. Not using `exec` because we need
+# the shell to stay alive so these run.
+cleanup() {
+  docker compose -f "$COMPOSE_FILE" --project-name "$COMPOSE_PROJECT_NAME" down --timeout 5 2>/dev/null || true
+  sync_creds_to_host
+}
+trap cleanup EXIT INT TERM
 
-exec docker compose -f "$COMPOSE_FILE" \
+docker compose -f "$COMPOSE_FILE" \
   --project-name "$COMPOSE_PROJECT_NAME" \
   run --rm \
   "${EXTRA_VOLUME_ARGS[@]}" \
   agent \
   "${HARNESS}-harness/index.ts" \
   "${TRANSLATED[@]}"
+EXIT_CODE=$?
+exit "$EXIT_CODE"

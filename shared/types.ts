@@ -1,6 +1,16 @@
 export interface HarnessConfig {
   userPrompt: string;
   workDir: string;
+  /**
+   * High-effort model — used by the Generator agent (heavy code reasoning,
+   * tool use, multi-step implementation).
+   */
+  modelHigh: string;
+  /**
+   * Low-effort model — used by the Planner, contract negotiation, and
+   * Evaluator agents (structured thinking, test-running, judgment).
+   */
+  modelLow: string;
   /** Optional: path to an existing codebase. When set, agents operate on this
    *  directory instead of creating a fresh app/ subdirectory. */
   appDir?: string;

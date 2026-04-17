@@ -1,6 +1,6 @@
 import { Codex } from "@openai/codex-sdk";
 import { EVALUATOR_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CODEX_MODEL, CODEX_NETWORK_ACCESS } from "../shared/config.ts";
+import { CODEX_NETWORK_ACCESS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 import type { SprintContract, EvalResult } from "../shared/types.ts";
 
@@ -9,6 +9,7 @@ export async function runEvaluator(
   appDir: string,
   contract: SprintContract,
   passThreshold: number,
+  model: string,
 ): Promise<EvalResult> {
   const sprint = contract.sprintNumber;
   log("EVALUATOR", `Evaluating sprint ${sprint} against ${contract.criteria.length} criteria`);
@@ -33,7 +34,7 @@ Examine the application at ${appDir}. Read the code, run it if possible, and sco
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   const turn = await thread.run(fullPrompt);

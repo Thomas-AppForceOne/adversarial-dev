@@ -12,6 +12,14 @@ services:
       # Empty string is treated as "not set" by Claude Code.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # Harness tuning knobs — forwarded from the host shell so users can
+      # override defaults without editing code. All are optional.
+      #   ADEV_TOOL_TIMEOUT_SEC   per-tool-call wall-clock timeout (default 900)
+      #   ADEV_QUOTA_MAX_RETRIES  retries on hard quota exhaustion (default 3)
+      #   ADEV_QUOTA_WAIT_MS      fallback wait between quota retries (default 5 min)
+      ADEV_TOOL_TIMEOUT_SEC: "${ADEV_TOOL_TIMEOUT_SEC:-}"
+      ADEV_QUOTA_MAX_RETRIES: "${ADEV_QUOTA_MAX_RETRIES:-}"
+      ADEV_QUOTA_WAIT_MS: "${ADEV_QUOTA_WAIT_MS:-}"
     volumes:
       - "${PROJECT_DIR}:/project:rw"
       - "${WORKSPACE_DIR}:/harness/workspace:rw"

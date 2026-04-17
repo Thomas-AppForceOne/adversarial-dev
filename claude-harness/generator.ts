@@ -1,5 +1,5 @@
 import { GENERATOR_SYSTEM_PROMPT, GENERATOR_EXISTING_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CLAUDE_MODEL, CLAUDE_MAX_TURNS } from "../shared/config.ts";
+import { CLAUDE_MAX_TURNS } from "../shared/config.ts";
 import { log } from "../shared/logger.ts";
 import { runClaude } from "../shared/claude-cli.ts";
 import { recordClaudeResult } from "../shared/usage.ts";
@@ -10,6 +10,7 @@ export async function runGenerator(
   appDir: string,
   spec: string,
   contract: SprintContract,
+  model: string,
   previousFeedback?: EvalResult,
 ): Promise<{ response: string; sessionId?: string }> {
   const sprint = contract.sprintNumber;
@@ -38,8 +39,10 @@ export async function runGenerator(
     cwd: isExisting ? appDir : workDir,
     systemPrompt: isExisting ? GENERATOR_EXISTING_SYSTEM_PROMPT : GENERATOR_SYSTEM_PROMPT,
     tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: CLAUDE_MAX_TURNS,
+    role: `GENERATOR/sprint ${sprint}${previousFeedback ? " retry" : ""}`,
+    timingsDir: workDir,
   })) {
     if (msg.type === "assistant") {
       for (const block of msg.message.content) {

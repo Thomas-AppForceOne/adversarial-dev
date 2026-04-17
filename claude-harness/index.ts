@@ -1,18 +1,28 @@
 import { resolve } from "path";
 import { readFile } from "fs/promises";
 import { runHarness } from "./harness.ts";
-import { DEFAULT_CONFIG } from "../shared/config.ts";
+import { DEFAULT_CONFIG, resolveClaudeModels, CLAUDE_MODELS } from "../shared/config.ts";
 import { log, logError, logDivider } from "../shared/logger.ts";
 import type { HarnessConfig } from "../shared/types.ts";
+
+// --models: print valid models and exit (no Docker/harness needed)
+if (process.argv.includes("--models")) {
+  console.log("Claude models (default: claude-sonnet-4-6):");
+  for (const m of CLAUDE_MODELS) console.log(`  ${m}`);
+  process.exit(0);
+}
 
 let userPrompt: string | undefined;
 let targetDir: string | undefined;
 let specFile: string | undefined;
 let specsDir: string | undefined;
 let resume = false;
+let cliModel: string | undefined;
+let cliModelHigh: string | undefined;
+let cliModelLow: string | undefined;
 
 // Parse argv: [node, script, ...args]
-// Supported flags: --file/-f <path>, --target/-t <path>, --spec/-s <path>, --specs <dir>, --resume/-r
+// Supported flags: --file/-f <path>, --target/-t <path>, --spec/-s <path>, --specs <dir>, --resume/-r, --model/-m <model>
 const args = process.argv.slice(2);
 const positional: string[] = [];
 
@@ -36,6 +46,15 @@ for (let i = 0; i < args.length; i++) {
     specsDir = resolve(d);
   } else if (a === "--resume" || a === "-r") {
     resume = true;
+  } else if (a === "--model" || a === "-m") {
+    cliModel = args[++i];
+    if (!cliModel) { console.error("Error: --model requires a model name"); process.exit(1); }
+  } else if (a === "--model-high") {
+    cliModelHigh = args[++i];
+    if (!cliModelHigh) { console.error("Error: --model-high requires a model name"); process.exit(1); }
+  } else if (a === "--model-low") {
+    cliModelLow = args[++i];
+    if (!cliModelLow) { console.error("Error: --model-low requires a model name"); process.exit(1); }
   } else {
     positional.push(a);
   }
@@ -54,6 +73,8 @@ if (!userPrompt && !specFile && !specsDir && !resume) {
   console.error('       bun run claude-harness/index.ts --target <existing-project-dir> <prompt>');
   console.error('       bun run claude-harness/index.ts --target <dir> --spec <spec-file>');
   console.error('       bun run claude-harness/index.ts --target <dir> --specs <specs-dir>');
+  console.error(`       bun run claude-harness/index.ts --model <model>  (valid: ${CLAUDE_MODELS.join(", ")})`);
+  console.error('       bun run claude-harness/index.ts --model-high <model> --model-low <model>   # two-tier: generator=high, rest=low');
   console.error('Example: bun run claude-harness/index.ts "Build a task manager"');
   console.error('Example: bun run claude-harness/index.ts --spec ./SPEC.md --target ~/projects/myapp');
   console.error('Example: bun run claude-harness/index.ts --specs ./specs/ --target ~/projects/myapp');
@@ -64,10 +85,14 @@ if (!userPrompt) {
   userPrompt = specFile ?? specsDir ?? "";
 }
 
+const { high: modelHigh, low: modelLow } = resolveClaudeModels(cliModel, cliModelHigh, cliModelLow);
+
 const config: HarnessConfig = {
   ...DEFAULT_CONFIG,
   userPrompt,
   workDir: resolve("workspace/claude"),
+  modelHigh,
+  modelLow,
   ...(targetDir ? { appDir: targetDir } : {}),
   ...(specFile ? { specFile } : {}),
   ...(specsDir ? { specsDir } : {}),
@@ -77,6 +102,12 @@ const config: HarnessConfig = {
 logDivider();
 log("HARNESS", "ADVERSARIAL DEV - Claude Agent SDK Harness");
 log("HARNESS", `Prompt: "${userPrompt}"`);
+if (modelHigh === modelLow) {
+  log("HARNESS", `Model:   ${modelHigh}`);
+} else {
+  log("HARNESS", `Model (high/generator): ${modelHigh}`);
+  log("HARNESS", `Model (low/planner,contract,evaluator): ${modelLow}`);
+}
 if (targetDir) log("HARNESS", `Target:  ${targetDir}`);
 if (specFile)  log("HARNESS", `Spec:    ${specFile}`);
 if (specsDir)  log("HARNESS", `Specs:   ${specsDir}`);

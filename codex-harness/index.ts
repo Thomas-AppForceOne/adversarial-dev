@@ -1,17 +1,27 @@
 import { resolve } from "path";
 import { readFile } from "fs/promises";
 import { runHarness } from "./harness.ts";
-import { DEFAULT_CONFIG } from "../shared/config.ts";
+import { DEFAULT_CONFIG, resolveCodexModels, CODEX_MODELS } from "../shared/config.ts";
 import { log, logError, logDivider } from "../shared/logger.ts";
 import type { HarnessConfig } from "../shared/types.ts";
+
+// --models: print valid models and exit (no Docker/harness needed)
+if (process.argv.includes("--models")) {
+  console.log("Codex models (default: gpt-5.4):");
+  for (const m of CODEX_MODELS) console.log(`  ${m}`);
+  process.exit(0);
+}
 
 let userPrompt: string | undefined;
 let targetDir: string | undefined;
 let specFile: string | undefined;
 let specsDir: string | undefined;
+let cliModel: string | undefined;
+let cliModelHigh: string | undefined;
+let cliModelLow: string | undefined;
 
 // Parse argv: [node, script, ...args]
-// Supported flags: --file/-f <path>, --target/-t <path>, --spec/-s <path>, --specs <dir>
+// Supported flags: --file/-f <path>, --target/-t <path>, --spec/-s <path>, --specs <dir>, --model/-m <model>
 const args = process.argv.slice(2);
 const positional: string[] = [];
 
@@ -33,6 +43,15 @@ for (let i = 0; i < args.length; i++) {
     const d = args[++i];
     if (!d) { console.error("Error: --specs requires a directory path"); process.exit(1); }
     specsDir = resolve(d);
+  } else if (a === "--model" || a === "-m") {
+    cliModel = args[++i];
+    if (!cliModel) { console.error("Error: --model requires a model name"); process.exit(1); }
+  } else if (a === "--model-high") {
+    cliModelHigh = args[++i];
+    if (!cliModelHigh) { console.error("Error: --model-high requires a model name"); process.exit(1); }
+  } else if (a === "--model-low") {
+    cliModelLow = args[++i];
+    if (!cliModelLow) { console.error("Error: --model-low requires a model name"); process.exit(1); }
   } else {
     positional.push(a);
   }
@@ -51,6 +70,8 @@ if (!userPrompt && !specFile && !specsDir) {
   console.error('       bun run codex-harness/index.ts --target <existing-project-dir> <prompt>');
   console.error('       bun run codex-harness/index.ts --target <dir> --spec <spec-file>');
   console.error('       bun run codex-harness/index.ts --target <dir> --specs <specs-dir>');
+  console.error(`       bun run codex-harness/index.ts --model <model>  (valid: ${CODEX_MODELS.join(", ")})`);
+  console.error('       bun run codex-harness/index.ts --model-high <model> --model-low <model>   # two-tier: generator=high, rest=low');
   console.error('Example: bun run codex-harness/index.ts "Build a task manager"');
   console.error('Example: bun run codex-harness/index.ts --spec ./SPEC.md --target ~/projects/myapp');
   console.error('Example: bun run codex-harness/index.ts --specs ./specs/ --target ~/projects/myapp');
@@ -61,10 +82,14 @@ if (!userPrompt) {
   userPrompt = specFile ?? specsDir ?? "";
 }
 
+const { high: modelHigh, low: modelLow } = resolveCodexModels(cliModel, cliModelHigh, cliModelLow);
+
 const config: HarnessConfig = {
   ...DEFAULT_CONFIG,
   userPrompt,
   workDir: resolve("workspace/codex"),
+  modelHigh,
+  modelLow,
   ...(targetDir ? { appDir: targetDir } : {}),
   ...(specFile ? { specFile } : {}),
   ...(specsDir ? { specsDir } : {}),
@@ -73,6 +98,12 @@ const config: HarnessConfig = {
 logDivider();
 log("HARNESS", "ADVERSARIAL DEV - Codex SDK Harness");
 log("HARNESS", `Prompt: "${userPrompt}"`);
+if (modelHigh === modelLow) {
+  log("HARNESS", `Model:   ${modelHigh}`);
+} else {
+  log("HARNESS", `Model (high/generator): ${modelHigh}`);
+  log("HARNESS", `Model (low/planner,contract,evaluator): ${modelLow}`);
+}
 if (targetDir) log("HARNESS", `Target:  ${targetDir}`);
 if (specFile)  log("HARNESS", `Spec:    ${specFile}`);
 if (specsDir)  log("HARNESS", `Specs:   ${specsDir}`);

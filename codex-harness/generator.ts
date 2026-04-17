@@ -1,6 +1,6 @@
 import { Codex } from "@openai/codex-sdk";
 import { GENERATOR_SYSTEM_PROMPT, GENERATOR_EXISTING_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CODEX_MODEL, CODEX_NETWORK_ACCESS } from "../shared/config.ts";
+import { CODEX_NETWORK_ACCESS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 import type { SprintContract, EvalResult } from "../shared/types.ts";
 
@@ -9,6 +9,7 @@ export async function runGenerator(
   appDir: string,
   spec: string,
   contract: SprintContract,
+  model: string,
   previousFeedback?: EvalResult,
 ): Promise<{ response: string }> {
   const sprint = contract.sprintNumber;
@@ -38,7 +39,7 @@ export async function runGenerator(
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   // Use streaming for generator to get visibility into long builds

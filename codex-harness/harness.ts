@@ -5,7 +5,7 @@ import {
   CONTRACT_NEGOTIATION_GENERATOR_PROMPT,
   CONTRACT_NEGOTIATION_EVALUATOR_PROMPT,
 } from "../shared/prompts.ts";
-import { CODEX_MODEL, CODEX_NETWORK_ACCESS } from "../shared/config.ts";
+import { CODEX_NETWORK_ACCESS } from "../shared/config.ts";
 import { log, logError, logDivider } from "../shared/logger.ts";
 import {
   initWorkspace,
@@ -63,10 +63,10 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
     await writeSpec(config.workDir, spec);
   } else if (config.specsDir) {
     log("HARNESS", `Assembling spec from directory: ${config.specsDir}`);
-    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir);
+    await runPlannerFromSpecsDir(config.specsDir, config.workDir, config.appDir, config.modelLow);
     spec = await readSpec(config.workDir);
   } else {
-    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir);
+    const plannerResponse = await runPlanner(config.userPrompt, config.workDir, config.appDir, config.modelLow);
     try {
       spec = await readSpec(config.workDir);
     } catch {
@@ -100,7 +100,7 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
     await writeProgress(config.workDir, progress);
 
     log("HARNESS", "Negotiating sprint contract...");
-    const contract = await negotiateContract(config.workDir, spec, sprint);
+    const contract = await negotiateContract(config.workDir, spec, sprint, config.modelLow);
     await writeContract(config.workDir, contract);
     log("HARNESS", `Contract agreed: ${contract.criteria.length} criteria for ${contract.features.length} features`);
 
@@ -117,13 +117,13 @@ export async function runHarness(config: HarnessConfig): Promise<HarnessResult> 
       progress.retryCount = retry;
       await writeProgress(config.workDir, progress);
 
-      await runGenerator(config.workDir, appDir, spec, contract, lastEval);
+      await runGenerator(config.workDir, appDir, spec, contract, config.modelHigh, lastEval);
 
       // Evaluate
       progress.status = "evaluating";
       await writeProgress(config.workDir, progress);
 
-      lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold);
+      lastEval = await runEvaluator(config.workDir, appDir, contract, config.passThreshold, config.modelLow);
       await writeFeedback(config.workDir, sprint, retry, lastEval);
 
       if (lastEval.passed) {
@@ -172,6 +172,7 @@ async function negotiateContract(
   workDir: string,
   spec: string,
   sprintNumber: number,
+  model: string,
 ): Promise<SprintContract> {
   const codex = new Codex();
 
@@ -183,7 +184,7 @@ async function negotiateContract(
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   const proposalTurn = await proposalThread.run(proposalPrompt);
@@ -197,26 +198,38 @@ async function negotiateContract(
     sandboxMode: "danger-full-access",
     networkAccessEnabled: CODEX_NETWORK_ACCESS,
     approvalPolicy: "never",
-    model: CODEX_MODEL,
+    model,
   });
 
   const reviewTurn = await reviewThread.run(reviewPrompt);
   const reviewText = reviewTurn.finalResponse ?? "";
 
-  const contractSource = reviewText.trim() === "APPROVED" ? proposalText : reviewText;
-  return parseContract(contractSource, sprintNumber);
+  // Bail early if neither agent produced anything useful (e.g. model error).
+  if (!proposalText.includes("{") && !reviewText.includes("{")) {
+    const detail = proposalText || reviewText || "(empty response)";
+    throw new Error(`Contract negotiation failed — agents returned no JSON. Response: ${detail.slice(0, 300)}`);
+  }
+
+  const isApproved = /^approved[.!]?$/i.test(reviewText.trim());
+  const contractSource = isApproved ? proposalText : reviewText;
+
+  return parseContract(contractSource, sprintNumber, proposalText);
 }
 
-function parseContract(text: string, sprintNumber: number): SprintContract {
-  // Try multiple extraction strategies
+function parseContract(text: string, sprintNumber: number, fallbackText?: string): SprintContract {
+  // Try multiple extraction strategies across the primary text and an optional fallback
+  const sources = fallbackText ? [text, fallbackText] : [text];
   const candidates: string[] = [];
-  const codeBlocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
-  for (const match of codeBlocks.reverse()) {
-    if (match[1]) candidates.push(match[1].trim());
+
+  for (const src of sources) {
+    const codeBlocks = [...src.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+    for (const match of codeBlocks.reverse()) {
+      if (match[1]) candidates.push(match[1].trim());
+    }
+    const braceMatch = src.match(/\{[\s\S]*"criteria"[\s\S]*\}/);
+    if (braceMatch) candidates.push(braceMatch[0]);
+    candidates.push(src.trim());
   }
-  const braceMatch = text.match(/\{[\s\S]*"criteria"[\s\S]*\}/);
-  if (braceMatch) candidates.push(braceMatch[0]);
-  candidates.push(text.trim());
 
   for (const candidate of candidates) {
     try {
@@ -232,6 +245,8 @@ function parseContract(text: string, sprintNumber: number): SprintContract {
 
   {
     logError("HARNESS", "Failed to parse contract JSON, creating default");
+    logError("HARNESS", `Primary response (${text.length} chars): ${text.slice(0, 300)}`);
+    if (fallbackText) logError("HARNESS", `Fallback response (${fallbackText.length} chars): ${fallbackText.slice(0, 300)}`);
     return {
       sprintNumber,
       features: [`Sprint ${sprintNumber} features`],

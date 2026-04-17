@@ -1,12 +1,12 @@
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { PLANNER_SYSTEM_PROMPT, PLANNER_SPECS_DIR_SYSTEM_PROMPT } from "../shared/prompts.ts";
-import { CLAUDE_MODEL, CLAUDE_MAX_TURNS } from "../shared/config.ts";
+import { CLAUDE_MAX_TURNS } from "../shared/config.ts";
 import { log, logError } from "../shared/logger.ts";
 import { runClaude } from "../shared/claude-cli.ts";
 import { recordClaudeResult } from "../shared/usage.ts";
 
-export async function runPlanner(userPrompt: string, workDir: string, appDir?: string): Promise<string> {
+export async function runPlanner(userPrompt: string, workDir: string, appDir: string | undefined, model: string): Promise<string> {
   log("PLANNER", `Starting planning for: "${userPrompt}"`);
 
   const existingContext = appDir
@@ -23,8 +23,10 @@ export async function runPlanner(userPrompt: string, workDir: string, appDir?: s
     cwd: workDir,
     systemPrompt: PLANNER_SYSTEM_PROMPT,
     tools: appDir ? ["Read", "Write", "Glob", "Grep"] : ["Read", "Write"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: CLAUDE_MAX_TURNS,
+    role: "PLANNER",
+    timingsDir: workDir,
   })) {
     if (msg.type === "assistant") {
       for (const block of msg.message.content) {
@@ -60,7 +62,7 @@ export async function runPlanner(userPrompt: string, workDir: string, appDir?: s
   return fullResponse;
 }
 
-export async function runPlannerFromSpecsDir(specsDir: string, workDir: string, appDir?: string): Promise<void> {
+export async function runPlannerFromSpecsDir(specsDir: string, workDir: string, appDir: string | undefined, model: string): Promise<void> {
   log("PLANNER", `Building spec from directory: ${specsDir}`);
 
   const existingContext = appDir
@@ -80,8 +82,10 @@ Discover all .md files in that directory (including subdirectories) using Glob. 
     cwd: workDir,
     systemPrompt: PLANNER_SPECS_DIR_SYSTEM_PROMPT,
     tools: ["Read", "Write", "Glob"],
-    model: CLAUDE_MODEL,
+    model,
     maxTurns: CLAUDE_MAX_TURNS,
+    role: "PLANNER/specs-dir",
+    timingsDir: workDir,
   })) {
     if (msg.type === "result") {
       recordClaudeResult("PLANNER/specs-dir", msg);
